@@ -12,6 +12,10 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include "SurrogateWindowsCompat.h"
+#else
 #include <unistd.h>
 
 #include <sys/socket.h>
@@ -20,9 +24,12 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#endif
 
+#ifndef _WIN32
 #include <dispatch/queue.h>
-#ifndef __APPLE__
+#endif
+#if !defined(__APPLE__) && !defined(_WIN32)
 #include <Block/Block.h>
 #endif
 
