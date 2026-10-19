@@ -8,6 +8,7 @@
 
 #include "SurrogateInternal.h"
 #include "SurrogateHelpers.h"
+#include "SurrogatePacketInfo.h"
 
 static CFDataRef createEnumerateDevicesMessage(MOMControllerRef controller,
                                                bool isSolicited) {
@@ -470,6 +471,42 @@ static void sendDiscoveryReply(MOMControllerRef controller,
         });
 }
 
+// DarwinのIP_PKTINFOはipi_spec_dstを0で返すことがある。
+// sin.sin_addrは送信元（DADman）なので、そこから自分のIPを補完してはいけない。
+// 受信NICに現在存在するIPv4と宛先を照合し、broadcastでもMOMの指定IPを維持する。
+static bool resolveReceivedLocalAddress(MOMControllerRef controller,
+                                        struct in_pktinfo *pktInfo, bool isDiscovery) {
+    // EchoはMOM identityを持たない共有portの応答。別slotのsocketで受けても、
+    // packet本来のローカル宛先で応答し、slotのbindAddressで落とさない。
+    const struct sockaddr_in *configured = isDiscovery
+        ? _MOMGetLocalInterfaceAddress(controller) : NULL;
+    struct ifaddrs *interfaces = NULL;
+    bool found = false;
+    if (getifaddrs(&interfaces) != 0)
+        return false;
+    for (const struct ifaddrs *ifp = interfaces; ifp; ifp = ifp->ifa_next) {
+        if (!ifp->ifa_addr || ifp->ifa_addr->sa_family != AF_INET ||
+            !(ifp->ifa_flags & IFF_UP))
+            continue;
+        const struct sockaddr_in *local = (const struct sockaddr_in *)ifp->ifa_addr;
+        const struct sockaddr_in *broadcast =
+            (ifp->ifa_flags & IFF_BROADCAST) && ifp->ifa_broadaddr &&
+                    ifp->ifa_broadaddr->sa_family == AF_INET
+                ? (const struct sockaddr_in *)ifp->ifa_broadaddr : NULL;
+        if (!_MOMPacketInfoMatchesInterface(
+                pktInfo->ipi_ifindex, if_nametoindex(ifp->ifa_name),
+                pktInfo->ipi_addr.s_addr, pktInfo->ipi_spec_dst.s_addr,
+                local->sin_addr.s_addr, broadcast ? broadcast->sin_addr.s_addr : 0,
+                broadcast != NULL, configured ? configured->sin_addr.s_addr : 0))
+            continue;
+        pktInfo->ipi_spec_dst = local->sin_addr;
+        found = true;
+        break;
+    }
+    freeifaddrs(interfaces);
+    return found;
+}
+
 static void handleUdpPacket(CFSocketRef s,
                             CFSocketCallBackType type,
                             CFDataRef address,
@@ -500,15 +537,18 @@ static void handleUdpPacket(CFSocketRef s,
 
     for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
         if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
-            struct in_pktinfo *pktInfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
-
-            /* preserve received address, because we may still send a broadcast
-             * packet */
-            if (pktInfo->ipi_spec_dst.s_addr == 0)
-                pktInfo->ipi_spec_dst.s_addr = sin.sin_addr.s_addr;
-
-            pktInfoData = CFDataCreate(kCFAllocatorDefault, CMSG_DATA(cmsg),
-                                       sizeof(struct in_pktinfo));
+            // ancillary dataを境界確認してコピーする。返信先のpeerはsinで別に保持し、
+            // ローカル宛先を解決できないpacketを別NICへ推測転送しない。
+            if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct in_pktinfo)))
+                break;
+            struct in_pktinfo pktInfo;
+            memcpy(&pktInfo, CMSG_DATA(cmsg), sizeof(pktInfo));
+            const bool discovery = len >= sizeof(_MOMDiscoveryString) &&
+                memcmp(udpPacket, _MOMDiscoveryString, sizeof(_MOMDiscoveryString)) == 0;
+            if (!resolveReceivedLocalAddress(controller, &pktInfo, discovery))
+                break;
+            pktInfoData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)&pktInfo,
+                                       sizeof(pktInfo));
             break;
         }
     }
@@ -522,7 +562,17 @@ static void handleUdpPacket(CFSocketRef s,
         CFDataRef peerAddress =
             CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, (uint8_t *)&sin,
                                         sizeof(sin), kCFAllocatorNull);
-        CFSocketSendDataWithPacketInfo(s, peerAddress, request, 0, pktInfoData);
+        struct in_pktinfo replyInfo;
+        memcpy(&replyInfo, CFDataGetBytePtr(pktInfoData), sizeof(replyInfo));
+        // Darwinは送信時ifindexをlocal IPより優先する。alias宛てEchoでもprimary IPへ
+        // 化けないよう、受信時に確定したlocal addressを明示して返信する。
+        replyInfo.ipi_ifindex = 0;
+        CFDataRef replyInfoData = CFDataCreate(
+            kCFAllocatorDefault, (const UInt8 *)&replyInfo, sizeof(replyInfo));
+        if (replyInfoData) {
+            CFSocketSendDataWithPacketInfo(s, peerAddress, request, 0, replyInfoData);
+            CFRelease(replyInfoData);
+        }
         CFRelease(peerAddress);
     } else if (isDiscoveryRequest(request)) {
         sendDiscoveryReply(controller, pktInfoData);
